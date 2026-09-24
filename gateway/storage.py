@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 from .models import (
     AccessRequest,
@@ -25,34 +26,85 @@ class GatewayStore:
         self.audits: list[AuditRecord] = []
         self._audit_seq = 0
 
-    # ---- 以下为空实现，后续逐步填充 ----
-
     def add_institution(self, institution: Institution) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self.institutions[institution.institution_id] = institution
 
     def add_patient(self, patient: Patient) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self.patients[patient.patient_id] = patient
 
     def get_patient(self, patient_id: str) -> Patient | None:
-        raise NotImplementedError
+        with self._lock:
+            return self.patients.get(patient_id)
 
     def save_consent(self, consent: ConsentStatement) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self.consents[consent.consent_id] = consent
 
     def get_consent(self, consent_id: str) -> ConsentStatement | None:
-        raise NotImplementedError
+        with self._lock:
+            return self.consents.get(consent_id)
 
     def consents_for_patient(self, patient_id: str) -> list[ConsentStatement]:
-        raise NotImplementedError
+        """返回该患者声明的一致性快照（同一锁内复制）。"""
+        with self._lock:
+            return [c for c in self.consents.values() if c.patient_id == patient_id]
 
     def get_decision(self, request_id: str) -> Decision | None:
-        raise NotImplementedError
+        with self._lock:
+            return self.decisions.get(request_id)
+
+    def decide_atomically(
+        self, request: AccessRequest, decide_fn: "Callable[[list[ConsentStatement]], Decision]"
+    ) -> tuple[Decision, bool]:
+        """在同一临界区内完成：幂等检查 -> 同意快照 -> 判定 -> 落审计。
+
+        保证声明在请求处理过程中被并发变更时，判定基于一致快照，
+        且同一 request_id 只会产生一条判定与一条审计记录。
+        """
+        with self._lock:
+            existing = self.decisions.get(request.request_id)
+            if existing is not None:
+                return existing, False
+            snapshot = [
+                c for c in self.consents.values() if c.patient_id == request.patient_id
+            ]
+            decision = decide_fn(snapshot)
+            self.decisions[request.request_id] = decision
+            self._audit_seq += 1
+            self.audits.append(
+                AuditRecord(
+                    audit_id=f"audit-{self._audit_seq:06d}",
+                    request=request,
+                    decision=decision,
+                )
+            )
+            return decision, True
 
     def record_decision_if_absent(
         self, request: AccessRequest, decision: Decision
     ) -> tuple[Decision, bool]:
-        """原子地记录判定与审计；若 request_id 已存在则返回已有判定。"""
-        raise NotImplementedError
+        """原子地记录判定与审计；若 request_id 已存在则返回已有判定。
+
+        返回 (最终判定, 是否为本次新写入)。重复/并发提交不会产生
+        重复审计记录，也不会覆盖首次结论。
+        """
+        with self._lock:
+            existing = self.decisions.get(request.request_id)
+            if existing is not None:
+                return existing, False
+            self.decisions[request.request_id] = decision
+            self._audit_seq += 1
+            self.audits.append(
+                AuditRecord(
+                    audit_id=f"audit-{self._audit_seq:06d}",
+                    request=request,
+                    decision=decision,
+                )
+            )
+            return decision, True
 
     def list_audits(self) -> list[AuditRecord]:
-        raise NotImplementedError
+        with self._lock:
+            return list(self.audits)
