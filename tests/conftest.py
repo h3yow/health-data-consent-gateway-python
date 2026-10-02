@@ -31,6 +31,8 @@ def store() -> GatewayStore:
 
 @pytest.fixture()
 def consents(store: GatewayStore) -> ConsentService:
+    # 同意声明引用的患者必须先登记（写入时校验）
+    store.add_patient(Patient("p1", "张三", 1980, diagnosis="flu"))
     return ConsentService(store)
 
 

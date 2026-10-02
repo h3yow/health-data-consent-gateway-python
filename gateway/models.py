@@ -83,6 +83,64 @@ class ConsentStatement:
     updated_at: datetime | None = None
 
 
+class ChangeType(enum.StrEnum):
+    """同意声明变更类型。"""
+
+    CREATED = "created"
+    AMENDED = "amended"
+    WITHDRAWN = "withdrawn"
+
+
+@dataclass(frozen=True)
+class ConsentHistoryEntry:
+    """同意声明的一次变更留痕：某一版本在何时成为当前状态。"""
+
+    consent_id: str
+    patient_id: str
+    version: int
+    change_type: ChangeType
+    status: ConsentStatus
+    purposes: frozenset[Purpose]
+    categories: frozenset[DataCategory]
+    recipients: frozenset[str]
+    valid_from: datetime
+    valid_until: datetime
+    changed_at: datetime  # 该版本生效（写入）的真实时间
+
+    @classmethod
+    def from_statement(
+        cls, consent: ConsentStatement, change_type: ChangeType
+    ) -> ConsentHistoryEntry:
+        return cls(
+            consent_id=consent.consent_id,
+            patient_id=consent.patient_id,
+            version=consent.version,
+            change_type=change_type,
+            status=consent.status,
+            purposes=consent.purposes,
+            categories=consent.categories,
+            recipients=consent.recipients,
+            valid_from=consent.valid_from,
+            valid_until=consent.valid_until,
+            changed_at=consent.updated_at,
+        )
+
+    def to_statement(self) -> ConsentStatement:
+        """还原该历史版本对应的声明状态（用于按时间点回溯判定）。"""
+        return ConsentStatement(
+            consent_id=self.consent_id,
+            patient_id=self.patient_id,
+            purposes=self.purposes,
+            categories=self.categories,
+            recipients=self.recipients,
+            valid_from=self.valid_from,
+            valid_until=self.valid_until,
+            status=self.status,
+            version=self.version,
+            updated_at=self.changed_at,
+        )
+
+
 @dataclass(frozen=True)
 class AccessRequest:
     """访问请求。request_id 由调用方提供，用于幂等去重。"""

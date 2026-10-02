@@ -6,6 +6,7 @@ from datetime import datetime
 from .consent import ConsentService
 from .models import (
     AccessRequest,
+    AuditRecord,
     ConsentStatement,
     Decision,
     DecisionOutcome,
@@ -34,6 +35,30 @@ class DecisionService:
 
         decision, _ = self._store.decide_atomically(request, decide)
         return decision
+
+    def evaluate_at(self, request: AccessRequest, at: datetime) -> Decision:
+        """按时间点回溯判定：把 at 时刻的同意状态还原出来重判一遍。
+
+        - 只读：不写判定、不落审计，用于事后复核。
+        - 依据声明变更历史还原 at 时刻每条声明的版本与状态；
+          当时未建立、已撤回、未生效或已过期的声明都不会被当作有效依据。
+        - 判定逻辑与实时判定完全一致（同一 _evaluate_fresh），
+          因此 at 取请求提交时刻时，结论与当时真实判定对得上。
+        """
+        snapshot = self._store.consents_at(request.patient_id, at)
+        return self._evaluate_fresh(request, snapshot, at)
+
+    def review(self, request_id: str) -> tuple[AuditRecord, Decision] | None:
+        """事后复核：返回 (原始审计记录, 按提交时刻回溯的重判结果)。
+
+        请求不存在时返回 None。重判按原始请求的 submitted_at 还原同意状态，
+        此后声明再被变更/撤回不影响回溯结论。
+        """
+        record = self._store.find_audit(request_id)
+        if record is None:
+            return None
+        retrospective = self.evaluate_at(record.request, record.request.submitted_at)
+        return record, retrospective
 
     def _evaluate_fresh(
         self,
