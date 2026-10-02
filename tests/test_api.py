@@ -1,5 +1,8 @@
 """HTTP 层冒烟测试：同意 -> 判定 -> 审计 -> 发布。"""
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+
+from tests.conftest import NOW as _NOW
+NOW = _NOW.astimezone()
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,7 +10,6 @@ from fastapi.testclient import TestClient
 from main import app, store
 from gateway.models import Institution, Patient
 
-NOW = datetime.now().astimezone()
 
 
 @pytest.fixture()
@@ -15,6 +17,7 @@ def client():
     store.institutions.clear()
     store.patients.clear()
     store.consents.clear()
+    store.consent_history.clear()
     store.decisions.clear()
     store.audits.clear()
     store.add_institution(Institution("hosp-a", "医院A"))

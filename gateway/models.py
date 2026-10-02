@@ -32,6 +32,14 @@ class ConsentStatus(enum.StrEnum):
     WITHDRAWN = "withdrawn"
 
 
+class ConsentHistoryAction(enum.StrEnum):
+    """同意声明历史动作。"""
+
+    CREATED = "created"
+    AMENDED = "amended"
+    WITHDRAWN = "withdrawn"
+
+
 class DecisionOutcome(enum.StrEnum):
     """访问判定结论。"""
 
@@ -123,3 +131,45 @@ class PublicationRow:
     group_key: str
     pseudonym_ids: tuple[str, ...]
     count: int
+
+
+@dataclass(frozen=True)
+class ConsentHistoryEntry:
+    """同意声明的一条不可变历史：建立 / 变更 / 撤回各留一条。
+
+    statement 为该动作完成后的声明完整快照（含版本号与状态）。
+    """
+
+    consent_id: str
+    version: int
+    action: ConsentHistoryAction
+    statement: ConsentStatement
+    changed_at: datetime
+
+
+@dataclass(frozen=True)
+class ReplayEvidence:
+    """回溯判定中一条声明的还原依据：该时刻生效的是哪个版本、为何用/不用。"""
+
+    consent_id: str
+    version: int
+    status: ConsentStatus | None
+    considered: bool  # 是否被当作有效放行依据
+    reason: str  # used / used_not_matching / withdrawn / not_yet_effective / expired / not_created
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """按某个时间点还原同意状态后的复核结论。
+
+    - decision：还原那一刻的同意状态后重判得到的结论。
+    - as_of：回溯时间点。
+    - evidence：逐条声明的版本还原依据。
+    - matches_original：与该请求当时真实判定的结论是否一致。
+    """
+
+    request: AccessRequest
+    decision: Decision
+    as_of: datetime
+    evidence: tuple[ReplayEvidence, ...]
+    matches_original: bool

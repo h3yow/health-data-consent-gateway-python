@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from gateway import consent as consent_mod
 from gateway.consent import ConsentService
 from gateway.decision import DecisionService
 from gateway.models import (
@@ -20,12 +21,50 @@ from gateway.storage import GatewayStore
 NOW = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
 
 
+class ControlledClock:
+    """把同意服务取墙钟的时间固定到 NOW，保证历史 changed_at 与
+    请求 submitted_at 处于同一时间基准（判定按 submitted_at 还原历史）。"""
+
+    def __init__(self) -> None:
+        self.current = NOW
+
+        class _DT(consent_mod.datetime):
+            outer = self
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.outer.current
+
+        self._dt = _DT
+
+    def install(self) -> None:
+        self._orig = consent_mod.datetime
+        consent_mod.datetime = self._dt
+
+    def restore(self) -> None:
+        consent_mod.datetime = self._orig
+
+    def advance(self, **delta) -> None:
+        self.current += timedelta(**delta)
+
+
+@pytest.fixture(autouse=True)
+def controlled_clock():
+    clock = ControlledClock()
+    clock.install()
+    yield clock
+    clock.restore()
+
+
 @pytest.fixture()
 def store() -> GatewayStore:
     s = GatewayStore()
     s.add_institution(Institution("hosp-a", "医院A"))
     s.add_institution(Institution("lab-b", "检验机构B"))
     s.add_institution(Institution("pharma-c", "药企C"))
+    # 声明测试直接建同意，患者主体需先登记（写入时即校验引用）；
+    # 不带发布分组属性，避免污染发布聚合测试
+    s.add_patient(Patient("p1", "张三", 1980))
     return s
 
 
