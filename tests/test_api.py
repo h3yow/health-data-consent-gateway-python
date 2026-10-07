@@ -148,24 +148,107 @@ def test_consent_create_validates_subjects(client: TestClient):
     print("\n[api] consent write-time validation OK")
 
 
-def test_access_request_validates_subjects(client: TestClient):
-    # 提交那一刻就失败，不落判定与审计
-    resp = client.post("/access-requests", json={
+def test_access_request_unknown_patient_returns_deny_decision(client: TestClient):
+    # 未登记患者提交访问请求：不是请求错误（200 + 判定体），
+    # 照常给一条 DENY 判定，原因明确是患者未登记，并留一条审计
+    body = {
         "request_id": "r-ghost-p", "patient_id": "ghost",
         "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
-    })
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == "patient_not_found"
+    }
+    resp = client.post("/access-requests", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["outcome"] == "deny"
+    assert data["allowed"] is False
+    assert data["reasons"] == ["patient_not_found"]
+    assert data["request_id"] == "r-ghost-p"
+    print(f"\n[api] unknown patient -> decision: {data}")
 
-    resp = client.post("/access-requests", json={
+    audits = client.get("/audits").json()
+    assert len(audits) == 1
+    assert audits[0]["request_id"] == "r-ghost-p"
+    assert audits[0]["patient_id"] == "ghost"
+    assert audits[0]["reasons"] == ["patient_not_found"]
+
+    # 同一请求重复提交：仍只有一条判定、一条审计
+    assert client.post("/access-requests", json=body).json()["reasons"] == [
+        "patient_not_found"
+    ]
+    assert len(client.get("/audits").json()) == 1
+    print("[api] unknown patient duplicate submission stays idempotent")
+
+
+def test_access_request_unknown_recipient_returns_deny_decision(client: TestClient):
+    # 未登记接收机构：同样照常返回判定，原因必须能与「患者未登记」及其它拒绝原因分开
+    body = {
         "request_id": "r-ghost-r", "patient_id": "p1",
         "recipient_id": "ghost-org", "purpose": "treatment", "categories": ["diagnosis"],
-    })
+    }
+    resp = client.post("/access-requests", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["outcome"] == "deny"
+    assert data["reasons"] == ["recipient_not_found"]
+    print(f"\n[api] unknown recipient -> decision: {data}")
+
+    audits = client.get("/audits").json()
+    assert len(audits) == 1
+    assert audits[0]["request_id"] == "r-ghost-r"
+    assert audits[0]["recipient_id"] == "ghost-org"
+    assert audits[0]["reasons"] == ["recipient_not_found"]
+
+    # 两种未登记主体各提交一条：判定原因互不混淆，审计各一条
+    other = {
+        "request_id": "r-ghost-p2", "patient_id": "ghost2",
+        "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
+    }
+    assert client.post("/access-requests", json=other).json()["reasons"] == [
+        "patient_not_found"
+    ]
+    audits = client.get("/audits").json()
+    assert len(audits) == 2
+    reasons_by_request = {a["request_id"]: a["reasons"] for a in audits}
+    assert reasons_by_request["r-ghost-r"] == ["recipient_not_found"]
+    assert reasons_by_request["r-ghost-p2"] == ["patient_not_found"]
+    print(f"[api] deny reasons stay distinguishable: {reasons_by_request}")
+
+
+def test_access_request_unknown_subject_concurrent_idempotent(client: TestClient):
+    """并发重复提交引用未登记主体的同一请求：恰好一条判定、一条审计。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    body = {
+        "request_id": "r-ghost-conc", "patient_id": "ghost",
+        "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
+    }
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _: client.post("/access-requests", json=body), range(16)))
+
+    assert all(r.status_code == 200 for r in responses)
+    assert all(r.json()["reasons"] == ["patient_not_found"] for r in responses)
+    audits = client.get("/audits").json()
+    assert len(audits) == 1
+    assert audits[0]["request_id"] == "r-ghost-conc"
+    print(f"\n[api] {len(responses)} concurrent unknown-subject submissions -> 1 audit")
+
+
+def test_consent_write_still_validates_subjects(client: TestClient):
+    # 声明写入时的主体校验保持不变：未登记直接挡下，不落库
+    resp = client.post("/consents", json=_consent_body(patient_id="ghost"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "patient_not_found"
+    resp = client.post("/consents", json=_consent_body(recipients=["ghost-org"]))
     assert resp.status_code == 422
     assert resp.json()["detail"] == "recipient_not_found"
 
-    assert client.get("/audits").json() == []
-    print("\n[api] access-request submit-time validation OK, no dirty audits")
+    # 被挡下的声明既查不到、也不会影响后续访问判定（不变成脏数据）
+    assert client.get("/consents/ghost/history").status_code == 404
+    resp = client.post("/access-requests", json={
+        "request_id": "r-after-dirty-consent", "patient_id": "p1",
+        "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
+    })
+    assert resp.json()["reasons"] == ["no_consent"]
+    print("\n[api] consent write-time validation still rejects dirty data")
 
 
 def test_consent_history_and_review_api(client: TestClient):

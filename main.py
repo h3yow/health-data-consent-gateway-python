@@ -228,11 +228,9 @@ def _decision_payload(decision, request: AccessRequest | None = None):
 
 @app.post("/access-requests")
 def submit_access_request(body: AccessRequestIn):
-    # 提交那一刻就校验主体：未登记的患者/机构明确失败，不落判定与审计
-    if store.get_patient(body.patient_id) is None:
-        raise HTTPException(status_code=422, detail="patient_not_found")
-    if store.get_institution(body.recipient_id) is None:
-        raise HTTPException(status_code=422, detail="recipient_not_found")
+    # 访问请求不在提交时拦截未登记主体：照常给出判定结论（DENY，
+    # 原因为 patient_not_found / recipient_not_found，二者可区分），
+    # 并在判定服务内幂等地落判定与审计，保证每次访问尝试都可追溯。
     request = AccessRequest(
         request_id=body.request_id,
         patient_id=body.patient_id,

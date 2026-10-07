@@ -150,6 +150,46 @@ def test_concurrent_mixed_requests_consistent_count(store, consents, decisions):
     assert len(store.decisions) == 20
 
 
+def test_unknown_subject_denial_is_audited_and_idempotent(store, decisions):
+    """未登记患者/机构的请求：照常给可区分的 DENY 判定并落审计；重复提交不重复计数。"""
+    req_p = make_request("r-ghost-p", patient_id="ghost-p")
+    d1 = decisions.evaluate(req_p)
+    log_decision(req_p, d1)
+    assert d1.reasons == (DenyReason.PATIENT_NOT_FOUND,)
+    assert len(store.list_audits()) == 1
+
+    d2 = decisions.evaluate(req_p)
+    assert d2 is d1
+    assert len(store.list_audits()) == 1
+
+    req_r = make_request("r-ghost-r", recipient_id="ghost-org")
+    d3 = decisions.evaluate(req_r)
+    log_decision(req_r, d3)
+    assert d3.reasons == (DenyReason.RECIPIENT_NOT_FOUND,)
+    assert len(store.list_audits()) == 2
+
+
+def test_unknown_subject_concurrent_submission_single_audit(store, decisions):
+    """并发提交引用未登记患者的同一请求：恰好一条判定、一条审计。"""
+    req = make_request("r-ghost-conc", patient_id="ghost-conc")
+    results = []
+
+    def worker():
+        results.append(decisions.evaluate(req))
+
+    threads = [Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    log_decision(req, results[0])
+    assert all(d is results[0] for d in results)
+    assert results[0].reasons == (DenyReason.PATIENT_NOT_FOUND,)
+    assert len(store.list_audits()) == 1
+    assert len(store.decisions) == 1
+
+
 def test_decision_stable_when_consent_changes(store, consents, decisions):
     """声明在请求处理期间被变更：结论基于快照，稳定且可解释。"""
     _setup_patient(store)

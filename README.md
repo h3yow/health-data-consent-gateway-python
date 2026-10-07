@@ -19,13 +19,22 @@
   原记录不被覆盖，不会出现两条互相打架的记录；并发登记同一 ID 恰好一个成功。
 - 查询不存在的患者 / 机构返回 **404**（`patient_not_found` / `institution_not_found`）。
 
-**写入时校验**：声明与访问请求引用未登记的主体时，在写入 / 提交那一刻就明确失败，
-不会先当成功存下来：
+**写入时校验（仅针对声明写入）**：声明引用未登记的主体时，在写入那一刻就
+明确失败，不会先当成功存下来：
 
 - `POST /consents` 引用未登记患者 → **422** `patient_not_found`；
   引用未登记接收方机构 → **422** `recipient_not_found`；`consent_id` 重复 → **409**。
-- `POST /access-requests` 引用未登记患者 / 机构 → **422** `patient_not_found` /
-  `recipient_not_found`，且不产生判定与审计记录。
+
+**访问请求不做提交时拦截**：`POST /access-requests` 引用未登记的患者或接收机构
+不属于请求格式错误，接口照常返回 **200** 和一条判定结果：
+
+- 结论为 `deny`，拒绝原因可区分：患者未登记 → `patient_not_found`，
+  接收机构未登记 → `recipient_not_found`，且不与 `no_consent`、
+  `recipient_not_covered` 等其它拒绝原因混用。
+- 这类请求同样落判定与审计（提交几条就有几条），事后可在 `GET /audits`
+  和 `GET /access-requests/{request_id}/review` 追溯到访问尝试。
+- 同一 `request_id` 重复或并发提交仍是幂等的：只保留首次判定，
+  判定与审计都只有一条。
 
 ## 同意模型
 
@@ -66,11 +75,15 @@
 
 `DecisionService.evaluate`（`gateway/decision.py`）：
 
+- **未登记主体也是判定结果**：请求引用未登记患者 / 机构时不报错，返回
+  `deny` + `patient_not_found` / `recipient_not_found`，两种原因可区分，
+  并与正常判定一样落库与留痕；这与声明写入时的 422 拦截是两条不同的链路。
 - **可区分拒绝原因**：`no_consent`、`consent_expired`、`consent_withdrawn`、
   `purpose_not_covered`、`category_not_covered`、`recipient_not_covered`、
   `patient_not_found`、`recipient_not_found`。
 - **幂等**：`request_id` 由调用方提供。同一 `request_id` 重复或并发提交，
-  返回首次判定，不重复放行、不重复计数、不产生重复审计。
+  返回首次判定（包括未登记主体的拒绝判定），不重复放行、不重复计数、
+  不产生重复审计。
 - **稳定性**：判定在存储锁内完成「幂等检查 → 同意快照 → 判定 → 落审计」，
   声明在处理期间被并发变更不影响本次结论；判定依据（命中声明的 ID 与版本）
   记录在 `Decision.basis` / `consent_versions` 中，放行与拒绝均留痕可解释。
@@ -91,15 +104,19 @@
 
 ## 兼容范围
 
-本版在上一版基础上新增主体登记、同意历史与回溯判定，原有能力保持兼容：
+本次仅修正「访问请求引用未登记主体」这一条链路，恢复升级前的返回语义：
 
-- 同意建立 / 变更 / 撤回的接口路径、字段与返回结构不变；
-  判定结论、拒绝原因取值、幂等语义、审计结构、发布行为与返回语义不变。
-- 服务层 `DecisionService.evaluate` 对未登记主体仍返回带
-  `patient_not_found` / `recipient_not_found` 原因的 DENY 判定（供既有调用方使用）；
-  HTTP 层则在提交时以 422 快速失败，不落判定与审计。
-- 新增的行为差异仅限「脏数据拦截」：引用未登记主体的声明 / 请求，
-  上一版会先存下来，本版在写入 / 提交时明确失败。
+- `POST /access-requests` 引用未登记患者 / 机构：恢复为 **200 + 判定体**
+  （`deny`，原因为 `patient_not_found` / `recipient_not_found`），
+  并恢复对应判定与审计留痕；不再返回 4xx、不再缺少判定结论。
+- 原有同意管理（建立 / 变更 / 撤回 / 历史）、访问判定、审计、回溯复核、
+  去标识化发布的接口路径、字段、返回结构与语义均不变；
+  各拒绝原因取值、幂等语义（重复 / 并发提交只产生一条判定与一条审计）、
+  按时间点回溯结论均不回退。
+- 声明写入校验保持现状：`POST /consents`（及变更接收方的
+  `PATCH /consents/{id}`）引用未登记主体仍在写入那一刻以 422 挡下、不落库；
+  `consent_id` 重复仍返回 409；同一主体重复登记仍返回 409。
+  「写入拦截脏数据」只作用于声明，不作用于访问请求。
 
 ## 本地验证
 
@@ -119,12 +136,24 @@ curl -s -X POST localhost:8000/institutions -H 'content-type: application/json' 
 curl -s -X POST localhost:8000/patients -H 'content-type: application/json' \
   -d '{"patient_id":"p1","name":"张三","birth_year":1980,"diagnosis":"flu"}'
 
-# 未登记患者建声明：写入时即失败
+# 未登记患者建声明：写入时即失败、不落库
 curl -s -X POST localhost:8000/consents -H 'content-type: application/json' \
   -d '{"consent_id":"cx","patient_id":"ghost","purposes":["treatment"],
        "categories":["diagnosis"],"recipients":["hosp-a"],
        "valid_from":"2026-01-01T00:00:00Z","valid_until":"2027-01-01T00:00:00Z"}'
-# -> {"detail":"patient_not_found"}
+# -> {"detail":"patient_not_found"}（422）
+
+# 未登记患者提交访问请求：照常返回判定（200），原因是 patient_not_found
+curl -s -X POST localhost:8000/access-requests -H 'content-type: application/json' \
+  -d '{"request_id":"r-ghost-p","patient_id":"ghost","recipient_id":"hosp-a",
+       "purpose":"treatment","categories":["diagnosis"]}'
+# -> {"request_id":"r-ghost-p","outcome":"deny","reasons":["patient_not_found"], ...}
+# 未登记接收机构：原因是 recipient_not_found，可与上一种区分
+curl -s -X POST localhost:8000/access-requests -H 'content-type: application/json' \
+  -d '{"request_id":"r-ghost-r","patient_id":"p1","recipient_id":"ghost-org",
+       "purpose":"treatment","categories":["diagnosis"]}'
+# 两条尝试各留一条审计；重复提交同一 request_id 不新增
+curl -s localhost:8000/audits
 
 # 正常建声明 -> 提交访问请求 -> 撤回 -> 查历史 -> 按提交时刻回溯复核
 curl -s -X POST localhost:8000/consents -H 'content-type: application/json' \
@@ -139,10 +168,19 @@ curl -s localhost:8000/consents/c1/history
 curl -s localhost:8000/access-requests/r1/review   # consistent: true
 ```
 
-测试覆盖：主体登记与重复冲突、写入时校验、同意历史留痕、按时间点回溯判定、
-并发登记 / 变更 / 撤回 / 提交的一致性、同意撤回与并发判定、越权访问
-（各拒绝原因可区分）、小样本阈值边界、重复 / 并发提交幂等、
+测试覆盖：主体登记与重复冲突、声明写入时校验（未登记主体不落脏数据）、
+同意历史留痕、按时间点回溯判定、并发登记 / 变更 / 撤回 / 提交的一致性、
+同意撤回与并发判定、越权访问（各拒绝原因可区分）、
+未登记患者 / 未登记接收机构提交访问请求（返回判定而非请求错误、原因可区分、
+审计条数、重复 / 并发提交幂等）、小样本阈值边界、重复 / 并发提交幂等、
 声明处理期变更的结论稳定性。
+
+按业务模块查看每个用例的执行情况（名称即业务点），`-s` 同时打印
+请求上下文、判定依据、历史与审计日志：
+
+```bash
+uv run pytest -v -s
+```
 
 环境变量：`GATEWAY_PSEUDONYM_SALT`（假名盐值，默认 dev-only）、
 `GATEWAY_MIN_GROUP_SIZE`（抑制阈值，默认 5）。

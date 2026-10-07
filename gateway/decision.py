@@ -69,7 +69,7 @@ class DecisionService:
         """基于给定同意快照做出判定（含可区分的拒绝原因与判定依据）。"""
         if self._store.get_patient(request.patient_id) is None:
             return self._deny(request, now, (DenyReason.PATIENT_NOT_FOUND,), ())
-        if request.recipient_id not in self._store.institutions:
+        if self._store.get_institution(request.recipient_id) is None:
             return self._deny(request, now, (DenyReason.RECIPIENT_NOT_FOUND,), ())
         if not snapshot:
             return self._deny(request, now, (DenyReason.NO_CONSENT,), ())
