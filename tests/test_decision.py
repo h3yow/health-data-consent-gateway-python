@@ -108,6 +108,43 @@ def test_duplicate_submission_idempotent(store, consents, decisions):
     assert len(store.decisions) == 1
 
 
+def test_unregistered_subject_denial_idempotent(store, consents, decisions):
+    """未登记患者 / 机构的 DENY 同样落判定与审计，且重复、并发提交只各一条。"""
+    req_p = make_request("r-ghost-p", patient_id="ghost")
+    req_r = make_request("r-ghost-r", recipient_id="ghost-org")
+    for req, expected in (
+        (req_p, DenyReason.PATIENT_NOT_FOUND),
+        (req_r, DenyReason.RECIPIENT_NOT_FOUND),
+    ):
+        d1 = decisions.evaluate(req)
+        d2 = decisions.evaluate(req)
+        log_decision(req, d2)
+        assert d1 is d2
+        assert d1.outcome == DecisionOutcome.DENY
+        assert d1.reasons == (expected,)
+
+    results: list = []
+
+    def worker():
+        results.append(decisions.evaluate(make_request("r-ghost-conc", patient_id="ghost2")))
+
+    threads = [Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(d is results[0] for d in results)
+    assert results[0].reasons == (DenyReason.PATIENT_NOT_FOUND,)
+
+    # 三条不同请求（含并发那条）恰好三条判定、三条审计
+    assert len(store.decisions) == 3
+    audits = store.list_audits()
+    assert len(audits) == 3
+    assert {a.request.request_id for a in audits} == {
+        "r-ghost-p", "r-ghost-r", "r-ghost-conc"
+    }
+
+
 def test_concurrent_submission_single_decision(store, consents, decisions):
     """并发提交同一请求：只产生一条判定与一条审计，结论一致。"""
     _setup_patient(store)

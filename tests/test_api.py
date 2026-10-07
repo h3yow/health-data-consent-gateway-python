@@ -1,5 +1,6 @@
 """HTTP 层冒烟测试：同意 -> 判定 -> 审计 -> 发布。"""
 from datetime import datetime, timedelta, timezone
+from threading import Thread
 
 import pytest
 from fastapi.testclient import TestClient
@@ -148,24 +149,103 @@ def test_consent_create_validates_subjects(client: TestClient):
     print("\n[api] consent write-time validation OK")
 
 
-def test_access_request_validates_subjects(client: TestClient):
-    # 提交那一刻就失败，不落判定与审计
+def test_access_request_unregistered_subjects_returns_decision(client: TestClient):
+    """未登记患者 / 未登记接收机构：请求本身有效，照常返回判定（200），
+    拒绝原因可区分且与其它拒绝原因不混；提交几条就落几条判定与审计。"""
+    # 未登记患者、接收机构已登记 -> DENY / patient_not_found
     resp = client.post("/access-requests", json={
         "request_id": "r-ghost-p", "patient_id": "ghost",
         "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
     })
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == "patient_not_found"
+    assert resp.status_code == 200, resp.text
+    body_p = resp.json()
+    assert body_p["request_id"] == "r-ghost-p"
+    assert body_p["outcome"] == "deny" and body_p["allowed"] is False
+    assert body_p["reasons"] == ["patient_not_found"]
+    print(f"\n[api] unregistered patient -> decision={body_p['outcome']} "
+          f"reasons={body_p['reasons']}")
 
+    # 患者已登记、接收机构未登记 -> DENY / recipient_not_found
     resp = client.post("/access-requests", json={
         "request_id": "r-ghost-r", "patient_id": "p1",
         "recipient_id": "ghost-org", "purpose": "treatment", "categories": ["diagnosis"],
     })
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == "recipient_not_found"
+    assert resp.status_code == 200, resp.text
+    body_r = resp.json()
+    assert body_r["outcome"] == "deny"
+    assert body_r["reasons"] == ["recipient_not_found"]
+    print(f"[api] unregistered recipient -> decision={body_r['outcome']} "
+          f"reasons={body_r['reasons']}")
 
-    assert client.get("/audits").json() == []
-    print("\n[api] access-request submit-time validation OK, no dirty audits")
+    # 两者与「主体都登记、只是没有声明」的 no_consent 明确区分
+    resp = client.post("/access-requests", json={
+        "request_id": "r-no-consent", "patient_id": "p1",
+        "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["reasons"] == ["no_consent"]
+    reason_sets = {tuple(b["reasons"]) for b in (body_p, body_r, resp.json())}
+    assert reason_sets == {
+        ("patient_not_found",), ("recipient_not_found",), ("no_consent",),
+    }
+
+    # 提交三条不同请求 -> 恰好三条判定、三条审计，逐条可追溯
+    audits = client.get("/audits").json()
+    assert len(audits) == 3
+    by_request = {a["request_id"]: a for a in audits}
+    assert set(by_request) == {"r-ghost-p", "r-ghost-r", "r-no-consent"}
+    assert by_request["r-ghost-p"]["patient_id"] == "ghost"
+    assert by_request["r-ghost-p"]["reasons"] == ["patient_not_found"]
+    assert by_request["r-ghost-r"]["recipient_id"] == "ghost-org"
+    assert by_request["r-ghost-r"]["reasons"] == ["recipient_not_found"]
+    assert all(a["outcome"] == "deny" for a in audits)
+    print(f"[api] {len(audits)} denied requests -> {len(audits)} audits (1:1)")
+
+    # 事后复核也查得到这次访问尝试
+    review = client.get("/access-requests/r-ghost-p/review").json()
+    assert review["original"]["reasons"] == ["patient_not_found"]
+    assert review["consistent"] is True
+
+
+def test_access_request_unregistered_subject_idempotent(client: TestClient):
+    """未登记主体请求重复 / 并发提交：始终只有一条判定、一条审计。"""
+    body = {
+        "request_id": "r-ghost-dup", "patient_id": "ghost",
+        "recipient_id": "hosp-a", "purpose": "treatment", "categories": ["diagnosis"],
+    }
+    first = client.post("/access-requests", json=body).json()
+    for _ in range(2):
+        again = client.post("/access-requests", json=body).json()
+        assert again["reasons"] == first["reasons"]
+        assert again["decided_at"] == first["decided_at"]
+    assert len(client.get("/audits").json()) == 1
+
+    # 并发提交同一 request_id（未登记接收机构）：只落一条判定与审计
+    concurrent_body = {
+        "request_id": "r-ghost-concurrent", "patient_id": "p1",
+        "recipient_id": "ghost-org", "purpose": "treatment",
+        "categories": ["diagnosis"],
+    }
+    payloads: list[dict] = []
+
+    def worker() -> None:
+        resp = client.post("/access-requests", json=concurrent_body)
+        assert resp.status_code == 200
+        payloads.append(resp.json())
+
+    threads = [Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(payloads) == 16
+    assert all(p["reasons"] == ["recipient_not_found"] for p in payloads)
+    assert all(p["decided_at"] == payloads[0]["decided_at"] for p in payloads)
+    audits = client.get("/audits").json()
+    assert len(audits) == 2  # r-ghost-dup 与 r-ghost-concurrent 各一条
+    assert sum(a["request_id"] == "r-ghost-concurrent" for a in audits) == 1
+    print(f"\n[api] 16 concurrent submissions -> 1 decision/audit, "
+          f"total audits={len(audits)}")
 
 
 def test_consent_history_and_review_api(client: TestClient):
